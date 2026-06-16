@@ -19,8 +19,9 @@ use rmcp::{
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, sync::Mutex};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use rmcp::model::Role;
@@ -577,7 +578,11 @@ impl ComputerControllerServer {
     }
 
     // Helper function to register a file as a resource
-    fn register_as_resource(&self, cache_path: &PathBuf, mime_type: &str) -> Result<(), ErrorData> {
+    async fn register_as_resource(
+        &self,
+        cache_path: &PathBuf,
+        mime_type: &str,
+    ) -> Result<(), ErrorData> {
         let uri = Url::from_file_path(cache_path)
             .map_err(|_| {
                 ErrorData::new(
@@ -595,7 +600,7 @@ impl ComputerControllerServer {
             meta: None,
         };
 
-        self.active_resources.lock().unwrap().insert(uri, resource);
+        self.active_resources.lock().await.insert(uri, resource);
         Ok(())
     }
 
@@ -688,7 +693,7 @@ impl ComputerControllerServer {
         let cache_path = self.save_to_cache(&content, "web", extension).await?;
 
         // Register as a resource
-        self.register_as_resource(&cache_path, mime_type)?;
+        self.register_as_resource(&cache_path, mime_type).await?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Content saved to: {}",
@@ -905,7 +910,7 @@ impl ComputerControllerServer {
             result.push_str(&format!("\n\nOutput saved to: {}", cache_path.display()));
 
             // Register as a resource
-            self.register_as_resource(&cache_path, "text")?;
+            self.register_as_resource(&cache_path, "text").await?;
         }
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
@@ -1033,7 +1038,7 @@ impl ComputerControllerServer {
             result.push_str(&format!("\n\nOutput saved to: {}", cache_path.display()));
 
             // Register as a resource
-            self.register_as_resource(&cache_path, "text")?;
+            self.register_as_resource(&cache_path, "text").await?;
         }
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
@@ -1571,10 +1576,7 @@ impl ComputerControllerServer {
 
                 // Remove from active resources if present
                 if let Ok(url) = Url::from_file_path(path) {
-                    self.active_resources
-                        .lock()
-                        .unwrap()
-                        .remove(&url.to_string());
+                    self.active_resources.lock().await.remove(&url.to_string());
                 }
 
                 Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1599,7 +1601,7 @@ impl ComputerControllerServer {
                 })?;
 
                 // Clear active resources
-                self.active_resources.lock().unwrap().clear();
+                self.active_resources.lock().await.clear();
 
                 Ok(CallToolResult::success(vec![Content::text(
                     "Cache cleared successfully.",
@@ -1630,7 +1632,7 @@ impl ServerHandler for ComputerControllerServer {
         _pagination: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let active_resources = self.active_resources.lock().unwrap();
+        let active_resources = self.active_resources.lock().await;
         let resources: Vec<Resource> = active_resources
             .keys()
             .map(|uri| {
@@ -1653,7 +1655,7 @@ impl ServerHandler for ComputerControllerServer {
         params: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
-        let active_resources = self.active_resources.lock().unwrap();
+        let active_resources = self.active_resources.lock().await;
         let resource = active_resources.get(&params.uri).ok_or_else(|| {
             ErrorData::new(
                 ErrorCode::INVALID_REQUEST,
@@ -1664,5 +1666,60 @@ impl ServerHandler for ComputerControllerServer {
 
         // Clone the resource to return
         Ok(ReadResourceResult::new(vec![resource.clone()]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verifies that concurrent calls to register_as_resource do not deadlock
+    // and that both entries are written to active_resources.
+    #[tokio::test]
+    async fn test_concurrent_registration_no_deadlock() {
+        let server = Arc::new(ComputerControllerServer::new());
+
+        let p1 = server.cache_dir.join("cc_test_concurrent_1.txt");
+        let p2 = server.cache_dir.join("cc_test_concurrent_2.txt");
+        std::fs::write(&p1, b"a").unwrap();
+        std::fs::write(&p2, b"b").unwrap();
+
+        let s1 = server.clone();
+        let s2 = server.clone();
+        let (r1, r2) = tokio::join!(
+            async move { s1.register_as_resource(&p1, "text/plain").await },
+            async move { s2.register_as_resource(&p2, "text/plain").await }
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        assert_eq!(server.active_resources.lock().await.len(), 2);
+    }
+
+    // Verifies register → lookup → remove → clear lifecycle.
+    #[tokio::test]
+    async fn test_resource_lifecycle() {
+        let server = ComputerControllerServer::new();
+
+        let path = server.cache_dir.join("cc_test_lifecycle.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        server.register_as_resource(&path, "text/plain").await.unwrap();
+
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+        assert!(server.active_resources.lock().await.contains_key(&uri));
+
+        server.active_resources.lock().await.remove(&uri);
+        assert!(server.active_resources.lock().await.is_empty());
+
+        let p1 = server.cache_dir.join("cc_test_clear_1.txt");
+        let p2 = server.cache_dir.join("cc_test_clear_2.txt");
+        std::fs::write(&p1, b"x").unwrap();
+        std::fs::write(&p2, b"y").unwrap();
+        server.register_as_resource(&p1, "text/plain").await.unwrap();
+        server.register_as_resource(&p2, "text/plain").await.unwrap();
+        assert_eq!(server.active_resources.lock().await.len(), 2);
+
+        server.active_resources.lock().await.clear();
+        assert!(server.active_resources.lock().await.is_empty());
     }
 }
